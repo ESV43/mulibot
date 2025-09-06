@@ -1,0 +1,8 @@
+{
+  "name": "Copy of Gemini Advanced Chat",
+  "description": "An advanced chat application with multi-agent architecture, multimodality, custom assistants, and more.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
