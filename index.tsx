@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect, useRef, FormEvent, FC, ReactNode, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
 import { GoogleGenAI, Content, Part, GenerateContentResponse, Chat, Modality, Type } from '@google/genai';
@@ -33,6 +32,8 @@ declare global {
   interface Window {
     SpeechRecognition: { new(): SpeechRecognition };
     webkitSpeechRecognition: { new(): SpeechRecognition };
+    loadPyodide: (config: { indexURL: string }) => Promise<any>;
+    JSZip: any;
   }
 }
 
@@ -52,11 +53,16 @@ const TITLE_GEN_INSTRUCTION = "Generate a very short, concise title (5 words or 
 
 // --- TYPES ---
 type Role = 'user' | 'model';
+interface MessageFile {
+  path: string;
+  content: string;
+}
 interface Message {
   id: string;
   role: Role;
   parts: Part[];
   citations?: any[];
+  files?: MessageFile[];
 }
 interface ChatSession {
   id: string;
@@ -75,10 +81,19 @@ interface Assistant {
   startMessages?: string[];
 }
 interface Attachment {
+  id: string;
   file: File;
   previewUrl: string;
-  status: 'idle' | 'processing';
+  status: 'processing' | 'ready' | 'error';
+  progress: number;
+  processedParts?: Part[];
+  errorMessage?: string;
 }
+interface ExecutionResult {
+  output: ReactNode;
+  isRunning: boolean;
+}
+
 
 // --- ICONS (as components) ---
 const SendIcon = () => <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="20" height="20"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>;
@@ -96,11 +111,13 @@ const FileIcon = () => <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 2
 const AudioIcon = () => <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="24" height="24"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg>;
 const SettingsIcon = () => <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="20" height="20"><path d="M19.43 12.98c.04-.32.07-.64.07-.98s-.03-.66-.07-.98l2.11-1.65c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.3-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65C14.46 2.18 14.25 2 14 2h-4c-.25 0-.46.18-.49.42l-.38 2.65c-.61.25-1.17.59-1.69-.98l-2.49-1c-.23-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64l2.11 1.65c-.04.32-.07.65-.07.98s.03.66.07.98l-2.11 1.65c-.19.15-.24.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.65c.03.24.24.42.49.42h4c.25 0 .46-.18.49.42l.38-2.65c.61-.25 1.17-.59 1.69-.98l2.49 1c.23.09.49 0 .61.22l2-3.46c.12-.22-.07-.49-.12-.64l-2.11-1.65zM12 15.5c-1.93 0-3.5-1.57-3.5-3.5s1.57-3.5 3.5-3.5 3.5 1.57 3.5 3.5-1.57 3.5-3.5 3.5z"/></svg>;
 const UploadIcon = () => <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="20" height="20"><path d="M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z"/></svg>;
+const PlayIcon = () => <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M8 5v14l11-7z"/></svg>;
+const DownloadIcon = () => <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="20" height="20"><path d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z"/></svg>;
 
 // --- DEFAULT DATA ---
 const DEFAULT_ASSISTANTS: Assistant[] = [
     { id: 'default-gemini', name: 'Gemini', description: 'The default, balanced Gemini model.', avatar: 'G', systemInstruction: '', defaultMode: 'pro', startMessages: [] },
-    { id: 'code-wizard', name: 'Code Wizard', description: 'Expert in all programming languages.', avatar: 'C', systemInstruction: 'You are a programming expert named Code Wizard. Provide only code, with brief explanations in comments. Prioritize efficiency and best practices.', defaultMode: 'pro', startMessages: ["Write a python script to...", "Explain this code...", "How do I implement a binary tree?"] },
+    { id: 'code-wizard', name: 'Code Wizard', description: 'Expert in all programming languages.', avatar: 'C', systemInstruction: "You are a programming expert named Code Wizard. Provide only code, with brief explanations in comments. Prioritize efficiency and best practices. **When generating a multi-file project, use markdown code blocks with the full file path (e.g., `src/components/Button.js`) as the language identifier.** The user's application can execute `python` and `html` code blocks and can bundle multi-file projects into a .zip file. The Python environment supports installing packages like `numpy`, `matplotlib`, `seaborn`, `pandas`, and `scikit-learn` on the fly. Visualizations generated with `matplotlib` will be displayed as images.", defaultMode: 'pro', startMessages: ["Write a python script to...", "Explain this code...", "How do I implement a binary tree?"] },
     { id: 'creative-writer', name: 'Creative Writer', description: 'Generates stories, poems, and scripts.', avatar: 'W', systemInstruction: 'You are a creative writer. Generate imaginative and engaging content. Adapt your style to the requested format (e.g., poem, script).', defaultMode: 'heavy', startMessages: ["Write a short story about...", "Create a poem about...", "Draft a script for a scene where..."] },
     {
         id: 'comic-creator',
@@ -128,60 +145,141 @@ const DEFAULT_ASSISTANTS: Assistant[] = [
 ];
 
 // --- FILE HELPERS ---
-const fileToGenerativePart = (file: File): Promise<Part> => {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = () => {
-        if (typeof reader.result === 'string') {
-            const resultParts = reader.result.split(',');
-            if (resultParts.length < 2) {
-                reject(new Error("Invalid file format."));
-                return;
-            }
-            resolve({
-                inlineData: {
-                    data: resultParts[1],
-                    mimeType: file.type,
-                },
-            });
-        } else {
-            reject(new Error("Failed to read file as data URL."));
-        }
-    };
-    reader.onerror = (error) => reject(error);
-    reader.readAsDataURL(file);
-  });
-};
-
-const readFileAsText = (file: File): Promise<string> => {
+const processFile = (file: File, onProgress: (progress: number) => void): Promise<Part[]> => {
     return new Promise((resolve, reject) => {
         const reader = new FileReader();
-        reader.onload = () => resolve(reader.result as string);
-        reader.onerror = (error) => reject(error);
-        reader.readAsText(file);
+
+        reader.onprogress = (event) => {
+            if (event.lengthComputable) {
+                const percentLoaded = Math.round((event.loaded / event.total) * 100);
+                onProgress(percentLoaded);
+            }
+        };
+
+        reader.onerror = (error) => reject(new Error(`Failed to read file: ${error}`));
+
+        const isTextBased = file.type.startsWith('text/') || file.name.endsWith('.txt') || file.name.endsWith('.csv');
+
+        if (isTextBased) {
+            reader.onload = () => {
+                onProgress(100);
+                const textContent = reader.result as string;
+                resolve([{ text: `\n--- Start of file: ${file.name} ---\n${textContent}\n--- End of file: ${file.name} ---\n` }]);
+            };
+            reader.readAsText(file);
+        } else { // Handle images, audio, pdf, etc. as inlineData
+            reader.onloadend = () => {
+                onProgress(100);
+                if (typeof reader.result === 'string') {
+                    const resultParts = reader.result.split(',');
+                    if (resultParts.length < 2) {
+                        reject(new Error("Invalid file format."));
+                        return;
+                    }
+                    const filePart = { inlineData: { data: resultParts[1], mimeType: file.type } };
+                    
+                    const needsAnalysisHint = !file.type.startsWith('image/') && !file.type.startsWith('video/') && !file.type.startsWith('audio/');
+                    if (needsAnalysisHint) {
+                        const textPart = { text: `\nThe user attached a file: "${file.name}". Analyze its content to answer the query.` };
+                        resolve([filePart, textPart]);
+                    } else {
+                        resolve([filePart]);
+                    }
+                } else {
+                    reject(new Error("Failed to read file as data URL."));
+                }
+            };
+            reader.readAsDataURL(file);
+        }
     });
 };
 
+const parseFilesFromMarkdown = (text: string): MessageFile[] => {
+    const fileRegex = /```(?<lang>[\w/\\.-]+)\n(?<code>[\s\S]*?)\n```/g;
+    const files: MessageFile[] = [];
+    let match;
+    while ((match = fileRegex.exec(text)) !== null) {
+        if (match.groups) {
+            const { lang: path, code } = match.groups;
+            // Basic check to see if it looks like a file path
+            if (path.includes('.') || path.includes('/')) {
+                files.push({ path, content: code });
+            }
+        }
+    }
+    return files;
+};
 
-const CodeBlock: FC<{ language: string; children: ReactNode }> = ({ language, children }) => {
+const CodeBlock: FC<{
+    language: string;
+    code: string;
+    messageId: string;
+    blockIndex: number;
+    isCodeWizard: boolean;
+    onRunCode: (language: string, code: string, messageId: string, blockIndex: number) => void;
+    executionResult?: ExecutionResult;
+}> = ({ language, code, messageId, blockIndex, isCodeWizard, onRunCode, executionResult }) => {
     const [copied, setCopied] = useState(false);
     const codeRef = useRef<HTMLPreElement>(null);
 
     const handleCopy = () => {
-        if (codeRef.current?.textContent) {
-            navigator.clipboard.writeText(codeRef.current.textContent);
-            setCopied(true);
-            setTimeout(() => setCopied(false), 2000);
-        }
+        navigator.clipboard.writeText(code);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
     };
+
+    const canExecute = isCodeWizard && ['python', 'html'].includes(language);
 
     return (
         <div className="code-block-wrapper">
-            <pre ref={codeRef}><code className={`language-${language}`}>{children}</code></pre>
-            <button onClick={handleCopy} className="copy-button">
-                {copied ? <CheckIcon /> : <CopyIcon />}
-                {copied ? 'Copied!' : 'Copy'}
-            </button>
+            <div className="code-block-header">
+                <span className="code-block-lang">{language}</span>
+                <div className="code-block-actions">
+                    {canExecute && (
+                        <button onClick={() => onRunCode(language, code, messageId, blockIndex)} className="code-action-button" disabled={executionResult?.isRunning}>
+                            {executionResult?.isRunning ? <div className="spinner-small-light"></div> : <PlayIcon />}
+                            {executionResult?.isRunning ? 'Running' : 'Run'}
+                        </button>
+                    )}
+                    <button onClick={handleCopy} className="code-action-button">
+                        {copied ? <CheckIcon /> : <CopyIcon />}
+                        {copied ? 'Copied' : 'Copy'}
+                    </button>
+                </div>
+            </div>
+            <pre ref={codeRef}><code className={`language-${language}`}>{code}</code></pre>
+            {executionResult && (
+                 <div className="code-output-area">
+                    {executionResult.output}
+                </div>
+            )}
+        </div>
+    );
+};
+
+const ProgressRing: FC<{ progress: number }> = ({ progress }) => {
+    const radius = 18;
+    const stroke = 3;
+    const normalizedRadius = radius - stroke;
+    const circumference = normalizedRadius * 2 * Math.PI;
+    const strokeDashoffset = circumference - (progress / 100) * circumference;
+
+    return (
+        <div className="progress-container">
+            <svg height={radius * 2} width={radius * 2} className="progress-ring">
+                <circle stroke="#555" fill="transparent" strokeWidth={stroke} r={normalizedRadius} cx={radius} cy={radius} />
+                <circle
+                  stroke="var(--accent-neon)"
+                  fill="transparent"
+                  strokeWidth={stroke}
+                  strokeDasharray={`${circumference} ${circumference}`}
+                  style={{ strokeDashoffset }}
+                  r={normalizedRadius}
+                  cx={radius}
+                  cy={radius}
+                />
+            </svg>
+            <span className="progress-text">{progress}%</span>
         </div>
     );
 };
@@ -209,7 +307,10 @@ const App: FC = () => {
   const [isMicrophoneSupported, setIsMicrophoneSupported] = useState<boolean>(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
-  const wakeLockRef = useRef<WakeLockSentinel | null>(null);
+  const wakeLockRef = useRef<any | null>(null); // Use 'any' for WakeLockSentinel to avoid TS errors
+  const [pyodide, setPyodide] = useState<any | null>(null);
+  const [isPyodideLoading, setIsPyodideLoading] = useState<boolean>(false);
+  const [executionResults, setExecutionResults] = useState<{[key: string]: ExecutionResult}>({});
 
   const [mainView, setMainView] = useState<'chat' | 'assistantEditor'>('chat');
   const [assistantInEditor, setAssistantInEditor] = useState<Assistant | null>(null);
@@ -259,7 +360,7 @@ const App: FC = () => {
     if (messageListRef.current) {
       messageListRef.current.scrollTop = messageListRef.current.scrollHeight;
     }
-  }, [chatSessions, activeChatId]);
+  }, [chatSessions, activeChatId, executionResults]);
 
   // Auto-resize textarea
   useEffect(() => {
@@ -288,7 +389,7 @@ const App: FC = () => {
         const acquireWakeLock = async () => {
             if ('wakeLock' in navigator && !wakeLockRef.current) {
                 try {
-                    wakeLockRef.current = await navigator.wakeLock!.request('screen');
+                    wakeLockRef.current = await (navigator as any).wakeLock.request('screen');
                 } catch (err: any) {
                     console.error(`Wake Lock failed: ${err.name}, ${err.message}`);
                 }
@@ -347,24 +448,49 @@ const App: FC = () => {
     setCurrentMode(e.target.value as AppMode);
   };
   
+  const addFilesToAttachments = (files: File[]) => {
+    const newAttachments: Attachment[] = files.map(file => ({
+      id: uuidv4(),
+      file,
+      previewUrl: URL.createObjectURL(file),
+      status: 'processing',
+      progress: 0,
+    }));
+    setAttachments(prev => [...prev, ...newAttachments]);
+
+    newAttachments.forEach(att => {
+      processFile(att.file, (progress) => {
+        setAttachments(prev => prev.map(a => 
+          a.id === att.id ? { ...a, progress } : a
+        ));
+      })
+      .then(parts => {
+        setAttachments(prev => prev.map(a => 
+          a.id === att.id ? { ...a, status: 'ready', processedParts: parts, progress: 100 } : a
+        ));
+      })
+      .catch(error => {
+        setAttachments(prev => prev.map(a => 
+          a.id === att.id ? { ...a, status: 'error', errorMessage: error.message, progress: 0 } : a
+        ));
+      });
+    });
+  };
+
   const handleAttachment = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
-      const files = Array.from(e.target.files);
-      const newAttachments: Attachment[] = files.map(file => ({
-        file,
-        previewUrl: URL.createObjectURL(file),
-        status: 'idle',
-      }));
-      setAttachments(prev => [...prev, ...newAttachments]);
+      addFilesToAttachments(Array.from(e.target.files));
+      e.target.value = ''; // Reset file input
     }
   };
 
-  const removeAttachment = (index: number) => {
+  const removeAttachment = (id: string) => {
     setAttachments(prev => {
-        const newAttachments = [...prev];
-        URL.revokeObjectURL(newAttachments[index].previewUrl);
-        newAttachments.splice(index, 1);
-        return newAttachments;
+        const attachmentToRemove = prev.find(att => att.id === id);
+        if (attachmentToRemove) {
+            URL.revokeObjectURL(attachmentToRemove.previewUrl);
+        }
+        return prev.filter(att => att.id !== id);
     });
   };
 
@@ -388,7 +514,7 @@ const App: FC = () => {
 
             if ('wakeLock' in navigator) {
                 try {
-                    wakeLockRef.current = await navigator.wakeLock!.request('screen');
+                    wakeLockRef.current = await (navigator as any).wakeLock.request('screen');
                 } catch (err: any) { console.error(`Wake Lock failed: ${err.name}, ${err.message}`); }
             }
 
@@ -401,13 +527,8 @@ const App: FC = () => {
             recorder.onstop = () => {
                 const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm;codecs=opus' });
                 const audioFile = new File([audioBlob], `recording-${Date.now()}.webm`, { type: audioBlob.type });
-                const newAttachment: Attachment = {
-                    file: audioFile,
-                    previewUrl: URL.createObjectURL(audioFile),
-                    status: 'idle',
-                };
-                setAttachments(prev => [...prev, newAttachment]);
-
+                addFilesToAttachments([audioFile]);
+                
                 stream.getTracks().forEach(track => track.stop());
                 releaseWakeLock();
                 setIsRecording(false);
@@ -436,7 +557,15 @@ const App: FC = () => {
 
   const handleSubmit = async (e?: FormEvent) => {
     e?.preventDefault();
-    if ((!input.trim() && attachments.length === 0) || isLoading) return;
+
+    const readyAttachments = attachments.filter(a => a.status === 'ready');
+    const hasProcessingFiles = attachments.some(a => a.status === 'processing');
+    const hasErrorFiles = attachments.some(a => a.status === 'error');
+
+    if (isLoading || hasProcessingFiles || hasErrorFiles || (!input.trim() && readyAttachments.length === 0)) {
+        if(hasErrorFiles) alert("Please remove files with errors before sending.");
+        return;
+    }
   
     if (!ai) {
       console.error("AI not initialized, API key might be missing.");
@@ -457,31 +586,12 @@ const App: FC = () => {
     try {
       const userMessageParts: Part[] = [];
 
-      // Process and show loading indicator for attachments
-      if (attachments.length > 0) {
-        setLoadingMessage('Processing files...');
-        setAttachments(prev => prev.map(att => ({ ...att, status: 'processing' })));
-        
-        const fileProcessingPromises = attachments.map(async (att) => {
-            const { file } = att;
-            if (file.type.startsWith('image/') || file.type.startsWith('video/') || file.type.startsWith('audio/')) {
-                return fileToGenerativePart(file);
-            } else if (file.type === 'text/plain' || file.type === 'text/csv') {
-                const textContent = await readFileAsText(file);
-                return { text: `\n\n--- Start of file: ${file.name} ---\n\n${textContent}\n\n--- End of file: ${file.name} ---\n` };
-            } else {
-                // For PDF and other complex files, send the file and a text prompt to analyze it.
-                const filePart = await fileToGenerativePart(file);
-                const textPart = { text: `\nThe user has attached a file named "${file.name}". Please analyze its content to answer the query. If it contains text (including handwritten), extract and use it.` };
-                return [filePart, textPart];
-            }
-        });
-        
-        const processedParts = (await Promise.all(fileProcessingPromises)).flat();
-        userMessageParts.push(...processedParts);
+      // Collect parts from ready attachments
+      if (readyAttachments.length > 0) {
+        const attachmentParts = readyAttachments.flatMap(a => a.processedParts || []);
+        userMessageParts.push(...attachmentParts);
       }
       
-      // Add user text input if it exists
       if (input.trim()) {
         userMessageParts.unshift({ text: input.trim() });
       }
@@ -490,7 +600,7 @@ const App: FC = () => {
       const thinkingMessage: Message = { id: thinkingMessageId, role: 'model', parts: [{ text: '...' }] };
   
       setInput('');
-      // Attachments will be cleared in the 'finally' block
+      // Attachments are cleared in the 'finally' block
   
       setChatSessions(prevSessions => {
         if (isNewChat) {
@@ -536,7 +646,6 @@ const App: FC = () => {
       }));
   
       let finalModelMessage: Message;
-      setLoadingMessage('Thinking...'); // Reset after file processing
 
       if (currentMode === 'image-gen') {
         const response = await ai.models.generateContent({
@@ -646,11 +755,15 @@ const App: FC = () => {
             finalResponse = await ai.models.generateContent({ model, contents: [...history, { role: 'user', parts: userMessage.parts }], config });
         }
   
+        const responseText = finalResponse.text;
+        const parsedFiles = parseFilesFromMarkdown(responseText);
+
         finalModelMessage = {
           id: uuidv4(),
           role: 'model',
           parts: finalResponse.candidates?.[0]?.content?.parts || [{ text: "Sorry, I couldn't generate a response." }],
           citations: finalResponse.candidates?.[0]?.groundingMetadata?.groundingChunks,
+          files: parsedFiles.length > 1 ? parsedFiles : undefined,
         };
       }
   
@@ -761,48 +874,218 @@ const App: FC = () => {
       if (isLoading) return;
 
       if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-          const files = Array.from(e.dataTransfer.files);
-          const newAttachments: Attachment[] = files.map(file => ({
-              file,
-              previewUrl: URL.createObjectURL(file),
-              status: 'idle',
-          }));
-          setAttachments(prev => [...prev, ...newAttachments]);
+          addFilesToAttachments(Array.from(e.dataTransfer.files));
           e.dataTransfer.clearData();
       }
   }, [isLoading]);
 
+  const handleRunCode = async (language: string, code: string, messageId: string, blockIndex: number) => {
+    const key = `${messageId}-${blockIndex}`;
+    setExecutionResults(prev => ({ ...prev, [key]: { output: '', isRunning: true } }));
 
-  const renderMessagePart = (part: Part, index: number) => {
+    if (language === 'python') {
+        let currentPyodide = pyodide;
+        if (!currentPyodide) {
+            if (isPyodideLoading) return;
+            setIsPyodideLoading(true);
+            setExecutionResults(prev => ({ ...prev, [key]: { output: 'Initializing Python environment...', isRunning: true } }));
+            try {
+                currentPyodide = await window.loadPyodide({ indexURL: "https://cdn.jsdelivr.net/pyodide/v0.25.1/full/" });
+                setPyodide(currentPyodide);
+            } catch (error) {
+                console.error("Pyodide load failed", error);
+                setExecutionResults(prev => ({ ...prev, [key]: { output: `Failed to load Python environment: ${error}`, isRunning: false } }));
+                setIsPyodideLoading(false);
+                return;
+            } finally {
+                setIsPyodideLoading(false);
+            }
+        }
+        
+        let output = '';
+        currentPyodide.setStdout({ batched: (str: string) => output += str + '\n' });
+        currentPyodide.setStderr({ batched: (str: string) => output += str + '\n' });
+        
+        try {
+            // 1. Parse for packages
+            const packageRegex = /(?:^|\n)\s*(?:import|from)\s+([a-zA-Z0-9_]+)/g;
+            const detectedPackages = new Set<string>();
+            let match;
+            while ((match = packageRegex.exec(code)) !== null) {
+                const pkgMap: { [key: string]: string } = { 'sklearn': 'scikit-learn', 'PIL': 'Pillow' };
+                const pkgName = match[1];
+                if (pkgName) detectedPackages.add(pkgMap[pkgName] || pkgName);
+            }
+
+            const packagesToInstall = Array.from(detectedPackages);
+
+            // 2. Install packages
+            if (packagesToInstall.length > 0) {
+                setExecutionResults(prev => ({ ...prev, [key]: { output: <pre>Installing packages: {packagesToInstall.join(', ')}...</pre>, isRunning: true } }));
+                await currentPyodide.loadPackage('micropip');
+                const micropip = currentPyodide.pyimport('micropip');
+                await micropip.install(packagesToInstall);
+                
+                // Special handling for matplotlib backend
+                if (packagesToInstall.includes('matplotlib')) {
+                    await currentPyodide.runPythonAsync(`
+                        import matplotlib
+                        matplotlib.use('svg')
+                        import matplotlib.pyplot as plt
+                        
+                        # Monkey-patch plt.show() to prevent a UserWarning in a non-GUI backend.
+                        # The user can still call it, but it will do nothing and not raise a warning.
+                        # We capture the plot using savefig later on.
+                        plt.show = lambda: None
+                    `);
+                }
+            }
+            
+            output = ''; // Clear installation messages
+            
+            // 3. Execute code
+            setExecutionResults(prev => ({ ...prev, [key]: { output: <pre>Executing code...</pre>, isRunning: true } }));
+            await currentPyodide.runPythonAsync(code);
+
+            // 4. Handle output, especially plots
+            let finalOutput: ReactNode = null;
+            let plotImage: ReactNode = null;
+            
+            if (packagesToInstall.includes('matplotlib')) {
+                const svg = currentPyodide.runPython(`
+                    import io, base64, sys
+                    import matplotlib.pyplot as plt
+                    
+                    svg_b64 = None
+                    # Check if there's an active figure
+                    if plt.get_fignums():
+                        buf = io.BytesIO()
+                        plt.savefig(buf, format='svg', bbox_inches='tight')
+                        buf.seek(0)
+                        svg_b64 = base64.b64encode(buf.read()).decode('utf-8')
+                        # Clean up the figure(s) after saving to prevent them from
+                        # appearing in the next run.
+                        plt.clf()
+                        plt.close('all')
+                    
+                    svg_b64
+                `);
+                
+                if (svg) {
+                    plotImage = <img src={`data:image/svg+xml;base64,${svg}`} alt="matplotlib plot" className="execution-plot" />;
+                }
+            }
+            
+            if (plotImage) {
+                finalOutput = (
+                    <>
+                        {plotImage}
+                        {output.trim() && <pre>{output.trim()}</pre>}
+                    </>
+                );
+            } else {
+                finalOutput = <pre>{output.trim() || 'Execution finished without output.'}</pre>
+            }
+            
+            setExecutionResults(prev => ({ ...prev, [key]: { output: finalOutput, isRunning: false } }));
+
+        } catch (error: any) {
+             setExecutionResults(prev => ({ ...prev, [key]: { output: <pre className="error">{error.message}</pre>, isRunning: false } }));
+        }
+
+    } else if (language === 'html') {
+        const blob = new Blob([code], { type: 'text/html' });
+        const url = URL.createObjectURL(blob);
+        const iframe = <iframe src={url} title="HTML Execution" sandbox="allow-scripts allow-modals" frameBorder="0" className="execution-iframe" onLoad={() => URL.revokeObjectURL(url)} />;
+        setExecutionResults(prev => ({ ...prev, [key]: { output: iframe, isRunning: false } }));
+    }
+  };
+
+  const handleDownloadZip = async (files: MessageFile[], title: string) => {
+    if (!window.JSZip) {
+        alert("File packaging library not loaded.");
+        return;
+    }
+    const zip = new window.JSZip();
+    files.forEach(file => {
+        zip.file(file.path, file.content);
+    });
+    
+    const blob = await zip.generateAsync({ type: 'blob' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = `${title.replace(/ /g, '_') || 'project'}.zip`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(link.href);
+  };
+
+  const renderMessagePart = (part: Part, message: Message, partIndex: number) => {
     if ('text' in part && part.text) {
-        return (
-            <ReactMarkdown
-                key={index}
-                remarkPlugins={[remarkGfm, remarkMath]}
-                rehypePlugins={[rehypeKatex]}
-                components={{
-                    code({ node, className, children, ...props }) {
-                        const match = /language-(\w+)/.exec(className || '');
-                        return match ? (
-                            <CodeBlock language={match[1]}>{String(children).replace(/\n$/, '')}</CodeBlock>
-                        ) : (
-                            <code className={className} {...props}>{children}</code>
-                        );
-                    },
-                }}
-            >
-                {part.text}
-            </ReactMarkdown>
-        );
+        return <MessageContentRenderer key={partIndex} part={part} message={message} />;
     }
     if ('inlineData' in part && part.inlineData) {
       const { mimeType, data } = part.inlineData;
       if (mimeType.startsWith('image/')) {
-        return <img key={index} src={`data:${mimeType};base64,${data}`} alt="Generated content" className="generated-image" />;
+        return <img key={partIndex} src={`data:${mimeType};base64,${data}`} alt="Generated content" className="generated-image" />;
       }
     }
     return null;
   };
+
+  const MessageContentRenderer: FC<{ part: Part, message: Message }> = ({ part, message }) => {
+    const text = (part as any).text || '';
+    const codeBlockRegex = /(```[\s\S]*?\n```)/g;
+    const segments = text.split(codeBlockRegex);
+    const isCodeWizard = (assistants.find(a => a.id === activeChat?.assistantId) || assistants[0]).id === 'code-wizard';
+    
+    let codeBlockCounter = 0;
+
+    return (
+        <>
+            {segments.map((segment, index) => {
+                if (segment.startsWith('```')) {
+                    const blockIndex = codeBlockCounter++;
+                    const key = `${message.id}-${blockIndex}`;
+                    const match = segment.match(/```(?<lang>[\w/\\.-]*)\n(?<code>[\s\S]*?)\n```/);
+                    if (match && match.groups) {
+                        const { lang, code } = match.groups;
+                        return (
+                            <CodeBlock
+                                key={index}
+                                language={lang || 'text'}
+                                code={code}
+                                messageId={message.id}
+                                blockIndex={blockIndex}
+                                isCodeWizard={isCodeWizard}
+                                onRunCode={handleRunCode}
+                                executionResult={executionResults[key]}
+                            />
+                        );
+                    }
+                }
+                
+                // Don't render file blocks again if they are part of a downloadable project
+                if (message.files && message.files.length > 1) return null;
+
+                return (
+                     <ReactMarkdown
+                        key={index}
+                        remarkPlugins={[remarkGfm, remarkMath]}
+                        rehypePlugins={[rehypeKatex]}
+                    >
+                        {segment}
+                    </ReactMarkdown>
+                );
+            })}
+        </>
+    );
+};
+
+  const canSubmit = !isLoading &&
+                    (input.trim().length > 0 || attachments.some(a => a.status === 'ready')) &&
+                    !attachments.some(a => a.status === 'processing' || a.status === 'error');
 
   return (
     <div className="app-container">
@@ -924,7 +1207,7 @@ const App: FC = () => {
                                                     </div>
                                                 ) : (
                                                     <>
-                                                        {msg.parts.map(renderMessagePart)}
+                                                        {msg.parts.map((part, index) => renderMessagePart(part, msg, index))}
                                                         {msg.citations && msg.citations.length > 0 && (
                                                             <div className="citations">
                                                                 <h4 className="citation-title">Sources</h4>
@@ -938,6 +1221,13 @@ const App: FC = () => {
                                                     </>
                                                 )}
                                             </div>
+                                             {msg.files && msg.files.length > 1 && (
+                                                <div className="message-footer">
+                                                    <button className="button button-secondary" onClick={() => handleDownloadZip(msg.files!, activeChat.title)}>
+                                                        <DownloadIcon/> Download Project (.zip)
+                                                    </button>
+                                                </div>
+                                            )}
                                         </div>
                                     </div>
                                 )
@@ -968,8 +1258,8 @@ const App: FC = () => {
                 <div className="input-area-container">
                     {attachments.length > 0 && (
                         <div className="attachments-preview">
-                            {attachments.map((att, index) => (
-                                <div key={index} className="attachment-item">
+                            {attachments.map((att) => (
+                                <div key={att.id} className="attachment-item">
                                     {att.file.type.startsWith('image/') ? (
                                         <img src={att.previewUrl} alt={att.file.name} />
                                     ) : att.file.type.startsWith('audio/') ? (
@@ -985,10 +1275,13 @@ const App: FC = () => {
                                     )}
                                     {att.status === 'processing' && (
                                         <div className="processing-overlay">
-                                            <div className="spinner-small"></div>
+                                            <ProgressRing progress={att.progress} />
                                         </div>
                                     )}
-                                    <button className="remove-attachment-button" onClick={() => removeAttachment(index)} disabled={isLoading}>&times;</button>
+                                    {att.status === 'error' && (
+                                        <div className="error-overlay" title={att.errorMessage}>!</div>
+                                    )}
+                                    <button className="remove-attachment-button" onClick={() => removeAttachment(att.id)} disabled={isLoading}>&times;</button>
                                 </div>
                             ))}
                         </div>
@@ -1009,7 +1302,7 @@ const App: FC = () => {
                         ref={fileInputRef} 
                         onChange={handleAttachment}
                         style={{ display: 'none' }} 
-                        accept="image/*,video/*,audio/*,text/*,.pdf,.csv,.doc,.docx"
+                        accept="image/*,video/*,audio/*,text/*,.pdf,.csv,.doc,.docx,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                     />
                     <textarea
                         ref={textareaRef}
@@ -1036,7 +1329,7 @@ const App: FC = () => {
                     >
                         <MicIcon />
                     </button>
-                    <button type="submit" className="icon-button send-button" disabled={(!input.trim() && attachments.length === 0) || isLoading} aria-label="Send message">
+                    <button type="submit" className="icon-button send-button" disabled={!canSubmit} aria-label="Send message">
                         <SendIcon />
                     </button>
                     </form>
