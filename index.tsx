@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useRef, FormEvent, FC, ReactNode, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
 import { GoogleGenAI, Content, Part, GenerateContentResponse, Chat, Modality, Type } from '@google/genai';
@@ -12,12 +13,21 @@ interface SpeechRecognition extends EventTarget {
   continuous: boolean;
   interimResults: boolean;
   lang: string;
+  onstart: () => void;
   onresult: (event: any) => void;
   onerror: (event: any) => void;
   onend: () => void;
   start: () => void;
   stop: () => void;
 }
+
+// Fix: The WakeLockSentinel and navigator.wakeLock types are now part of the
+// standard TypeScript DOM library. The previous manual declarations were
+// conflicting with the built-in types, causing compilation errors.
+// By removing them, we rely on the standard library definitions, which resolves
+// the type conflict. The application code already performs runtime feature
+// detection for `navigator.wakeLock`, so it remains safe for browsers that
+// do not support this API.
 
 declare global {
   interface Window {
@@ -28,8 +38,11 @@ declare global {
 
 
 // --- MODELS ---
-const CHAT_MODEL = 'gemini-2.5-flash';
+const HEAVY_MODEL = 'gemini-2.5-pro';
+const PRO_MODEL = 'gemini-2.5-flash';
+const QUICK_MODEL = 'gemini-2.5-flash-lite';
 const IMAGE_MODEL = 'gemini-2.5-flash-image-preview'; // Used for both generation and editing
+const TITLE_GEN_MODEL = 'gemini-2.5-flash';
 
 // --- AGENT INSTRUCTIONS ---
 const INITIAL_SYSTEM_INSTRUCTION = "You are an expert-level AI assistant. Your task is to provide a comprehensive, accurate, and well-reasoned initial response to the user's query. Aim for clarity and depth. Note: Your response is an intermediate step for other AI agents and will not be shown to the user. Be concise and focus on core information without unnecessary verbosity.";
@@ -51,7 +64,7 @@ interface ChatSession {
   messages: Message[];
   assistantId: string;
 }
-type AppMode = 'superfast' | 'goat' | 'ultra' | 'super' | 'image-gen';
+type AppMode = 'quick' | 'flash' | 'pro' | 'heavy' | 'image-gen';
 interface Assistant {
   id: string;
   name: string;
@@ -59,10 +72,12 @@ interface Assistant {
   avatar: string; // First letter of name
   systemInstruction: string;
   defaultMode: AppMode;
+  startMessages?: string[];
 }
 interface Attachment {
   file: File;
   previewUrl: string;
+  status: 'idle' | 'processing';
 }
 
 // --- ICONS (as components) ---
@@ -78,13 +93,15 @@ const CopyIcon = () => <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 2
 const CloseIcon = () => <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="24" height="24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>;
 const AssistantIcon = () => <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="20" height="20"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>;
 const FileIcon = () => <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="24" height="24"><path d="M6 2c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6H6zm7 7V3.5L18.5 9H13z"/></svg>;
-const SettingsIcon = () => <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="20" height="20"><path d="M19.43 12.98c.04-.32.07-.64.07-.98s-.03-.66-.07-.98l2.11-1.65c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.3-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65C14.46 2.18 14.25 2 14 2h-4c-.25 0-.46.18-.49.42l-.38 2.65c-.61.25-1.17.59-1.69-.98l-2.49-1c-.23-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64l2.11 1.65c-.04.32-.07.65-.07.98s.03.66.07.98l-2.11 1.65c-.19.15-.24.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.65c.03.24.24.42.49.42h4c.25 0 .46-.18.49-.42l.38-2.65c.61-.25 1.17-.59 1.69-.98l2.49 1c.23.09.49 0 .61.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.65zM12 15.5c-1.93 0-3.5-1.57-3.5-3.5s1.57-3.5 3.5-3.5 3.5 1.57 3.5 3.5-1.57 3.5-3.5 3.5z"/></svg>;
+const AudioIcon = () => <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="24" height="24"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg>;
+const SettingsIcon = () => <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="20" height="20"><path d="M19.43 12.98c.04-.32.07-.64.07-.98s-.03-.66-.07-.98l2.11-1.65c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.3-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65C14.46 2.18 14.25 2 14 2h-4c-.25 0-.46.18-.49.42l-.38 2.65c-.61.25-1.17.59-1.69-.98l-2.49-1c-.23-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64l2.11 1.65c-.04.32-.07.65-.07.98s.03.66.07.98l-2.11 1.65c-.19.15-.24.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.65c.03.24.24.42.49.42h4c.25 0 .46-.18.49.42l.38-2.65c.61-.25 1.17-.59 1.69-.98l2.49 1c.23.09.49 0 .61.22l2-3.46c.12-.22-.07-.49-.12-.64l-2.11-1.65zM12 15.5c-1.93 0-3.5-1.57-3.5-3.5s1.57-3.5 3.5-3.5 3.5 1.57 3.5 3.5-1.57 3.5-3.5 3.5z"/></svg>;
+const UploadIcon = () => <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="20" height="20"><path d="M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z"/></svg>;
 
 // --- DEFAULT DATA ---
 const DEFAULT_ASSISTANTS: Assistant[] = [
-    { id: 'default-gemini', name: 'Gemini', description: 'The default, balanced Gemini model.', avatar: 'G', systemInstruction: '', defaultMode: 'super' },
-    { id: 'code-wizard', name: 'Code Wizard', description: 'Expert in all programming languages.', avatar: 'C', systemInstruction: 'You are a programming expert named Code Wizard. Provide only code, with brief explanations in comments. Prioritize efficiency and best practices.', defaultMode: 'super' },
-    { id: 'creative-writer', name: 'Creative Writer', description: 'Generates stories, poems, and scripts.', avatar: 'W', systemInstruction: 'You are a creative writer. Generate imaginative and engaging content. Adapt your style to the requested format (e.g., poem, script).', defaultMode: 'ultra' },
+    { id: 'default-gemini', name: 'Gemini', description: 'The default, balanced Gemini model.', avatar: 'G', systemInstruction: '', defaultMode: 'pro', startMessages: [] },
+    { id: 'code-wizard', name: 'Code Wizard', description: 'Expert in all programming languages.', avatar: 'C', systemInstruction: 'You are a programming expert named Code Wizard. Provide only code, with brief explanations in comments. Prioritize efficiency and best practices.', defaultMode: 'pro', startMessages: ["Write a python script to...", "Explain this code...", "How do I implement a binary tree?"] },
+    { id: 'creative-writer', name: 'Creative Writer', description: 'Generates stories, poems, and scripts.', avatar: 'W', systemInstruction: 'You are a creative writer. Generate imaginative and engaging content. Adapt your style to the requested format (e.g., poem, script).', defaultMode: 'heavy', startMessages: ["Write a short story about...", "Create a poem about...", "Draft a script for a scene where..."] },
     {
         id: 'comic-creator',
         name: 'Comic Creator',
@@ -105,11 +122,13 @@ const DEFAULT_ASSISTANTS: Assistant[] = [
     *   **Add Captions:** Write a brief caption, dialogue, or thought bubble for each panel to advance the story.
     *   **Creative Freedom:** Be imaginative and bold in your visual interpretations. Focus on artistic expression and storytelling to create a high-quality, uncensored comic.
     *   **Output Format:** Present the final result as a sequence of images, each followed by its corresponding text caption.`,
-        defaultMode: 'image-gen'
+        defaultMode: 'image-gen',
+        startMessages: ["A lone astronaut discovers an ancient alien artifact on a desolate moon.", "A detective in a rain-soaked city chases a mysterious figure through neon-lit alleys."]
     }
 ];
 
-const fileToGenerativePart = async (file: File): Promise<Part> => {
+// --- FILE HELPERS ---
+const fileToGenerativePart = (file: File): Promise<Part> => {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onloadend = () => {
@@ -133,6 +152,16 @@ const fileToGenerativePart = async (file: File): Promise<Part> => {
     reader.readAsDataURL(file);
   });
 };
+
+const readFileAsText = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.onerror = (error) => reject(error);
+        reader.readAsText(file);
+    });
+};
+
 
 const CodeBlock: FC<{ language: string; children: ReactNode }> = ({ language, children }) => {
     const [copied, setCopied] = useState(false);
@@ -166,17 +195,24 @@ const App: FC = () => {
   const [input, setInput] = useState<string>('');
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [loadingMessage, setLoadingMessage] = useState<string>('');
-  const [currentMode, setCurrentMode] = useState<AppMode>('super');
+  const [currentMode, setCurrentMode] = useState<AppMode>('pro');
   const [useGoogleSearch, setUseGoogleSearch] = useState<boolean>(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(window.innerWidth > 768);
   const [isRecording, setIsRecording] = useState<boolean>(false);
-  const recognitionRef = useRef<SpeechRecognition | null>(null);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [assistants, setAssistants] = useState<Assistant[]>(DEFAULT_ASSISTANTS);
   const [isAssistantModalOpen, setIsAssistantModalOpen] = useState(false);
-  const [editingAssistant, setEditingAssistant] = useState<Assistant | null>(null);
   const [isApiKeyModalOpen, setIsApiKeyModalOpen] = useState(false);
+  const [isDraggingOver, setIsDraggingOver] = useState<boolean>(false);
+  const dragCounter = useRef(0);
+  const [isMicrophoneSupported, setIsMicrophoneSupported] = useState<boolean>(false);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const wakeLockRef = useRef<WakeLockSentinel | null>(null);
+
+  const [mainView, setMainView] = useState<'chat' | 'assistantEditor'>('chat');
+  const [assistantInEditor, setAssistantInEditor] = useState<Assistant | null>(null);
 
   const messageListRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -235,20 +271,62 @@ const App: FC = () => {
     }
   }, [input]);
 
+  // Check for Microphone API support on mount
+  useEffect(() => {
+    setIsMicrophoneSupported(!!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia));
+  }, []);
+
+    // Effect to manage the screen wake lock
+    useEffect(() => {
+        const releaseWakeLock = async () => {
+            if (wakeLockRef.current) {
+                await wakeLockRef.current.release();
+                wakeLockRef.current = null;
+            }
+        };
+
+        const acquireWakeLock = async () => {
+            if ('wakeLock' in navigator && !wakeLockRef.current) {
+                try {
+                    wakeLockRef.current = await navigator.wakeLock!.request('screen');
+                } catch (err: any) {
+                    console.error(`Wake Lock failed: ${err.name}, ${err.message}`);
+                }
+            }
+        };
+
+        const handleVisibilityChange = () => {
+            if (wakeLockRef.current && document.visibilityState === 'visible' && isRecording) {
+                acquireWakeLock();
+            }
+        };
+
+        document.addEventListener('visibilitychange', handleVisibilityChange);
+
+        return () => {
+            releaseWakeLock();
+            document.removeEventListener('visibilitychange', handleVisibilityChange);
+        };
+    }, [isRecording]);
+
+
   const activeChat = chatSessions.find(c => c.id === activeChatId);
   const currentAssistant = assistants.find(a => a.id === currentAssistantId) || assistants[0];
 
-  const createNewChat = () => {
+  const createNewChat = (assistantIdOverride?: string) => {
+    const assistantId = assistantIdOverride || currentAssistantId;
+    const assistant = assistants.find(a => a.id === assistantId) || assistants[0];
+
     const newChat: ChatSession = {
       id: uuidv4(),
       title: 'New Chat',
       messages: [],
-      assistantId: currentAssistantId
+      assistantId: assistantId,
     };
     const newSessions = [newChat, ...chatSessions];
     setChatSessions(newSessions);
     setActiveChatId(newChat.id);
-    setCurrentMode(currentAssistant.defaultMode);
+    setCurrentMode(assistant.defaultMode);
   };
 
   const deleteChat = (e: React.MouseEvent, chatId: string) => {
@@ -262,11 +340,7 @@ const App: FC = () => {
 
   const switchAssistant = (assistantId: string) => {
     setCurrentAssistantId(assistantId);
-    const assistant = assistants.find(a => a.id === assistantId);
-    if (assistant) {
-        setCurrentMode(assistant.defaultMode);
-    }
-    createNewChat();
+    createNewChat(assistantId);
   };
 
   const handleModeChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
@@ -278,52 +352,87 @@ const App: FC = () => {
       const files = Array.from(e.target.files);
       const newAttachments: Attachment[] = files.map(file => ({
         file,
-        previewUrl: URL.createObjectURL(file)
+        previewUrl: URL.createObjectURL(file),
+        status: 'idle',
       }));
       setAttachments(prev => [...prev, ...newAttachments]);
     }
   };
 
   const removeAttachment = (index: number) => {
-    const newAttachments = [...attachments];
-    URL.revokeObjectURL(newAttachments[index].previewUrl);
-    newAttachments.splice(index, 1);
-    setAttachments(newAttachments);
+    setAttachments(prev => {
+        const newAttachments = [...prev];
+        URL.revokeObjectURL(newAttachments[index].previewUrl);
+        newAttachments.splice(index, 1);
+        return newAttachments;
+    });
   };
 
-  const toggleRecording = () => {
-    if (isRecording) {
-      recognitionRef.current?.stop();
-      setIsRecording(false);
-    } else {
-      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (!SpeechRecognition) {
-        alert("Speech recognition not supported in this browser.");
-        return;
-      }
-      const recognition = new SpeechRecognition();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.onresult = (event) => {
-        let interimTranscript = '';
-        let finalTranscript = '';
-        for (let i = event.resultIndex; i < event.results.length; ++i) {
-          if (event.results[i].isFinal) {
-            finalTranscript += event.results[i][0].transcript;
-          } else {
-            interimTranscript += event.results[i][0].transcript;
-          }
+  const toggleRecording = async () => {
+    const releaseWakeLock = async () => {
+        if (wakeLockRef.current) {
+            await wakeLockRef.current.release();
+            wakeLockRef.current = null;
         }
-        setInput(input + finalTranscript + interimTranscript);
-      };
-      recognition.onerror = (event) => console.error("Speech recognition error:", event.error);
-      recognition.onend = () => setIsRecording(false);
+    };
 
-      recognition.start();
-      recognitionRef.current = recognition;
-      setIsRecording(true);
+    if (isRecording) {
+        mediaRecorderRef.current?.stop();
+    } else {
+        if (!isMicrophoneSupported) {
+            alert("Your browser does not support audio recording.");
+            return;
+        }
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+            if ('wakeLock' in navigator) {
+                try {
+                    wakeLockRef.current = await navigator.wakeLock!.request('screen');
+                } catch (err: any) { console.error(`Wake Lock failed: ${err.name}, ${err.message}`); }
+            }
+
+            const recorder = new MediaRecorder(stream);
+            mediaRecorderRef.current = recorder;
+            audioChunksRef.current = [];
+
+            recorder.ondataavailable = (event) => audioChunksRef.current.push(event.data);
+            
+            recorder.onstop = () => {
+                const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm;codecs=opus' });
+                const audioFile = new File([audioBlob], `recording-${Date.now()}.webm`, { type: audioBlob.type });
+                const newAttachment: Attachment = {
+                    file: audioFile,
+                    previewUrl: URL.createObjectURL(audioFile),
+                    status: 'idle',
+                };
+                setAttachments(prev => [...prev, newAttachment]);
+
+                stream.getTracks().forEach(track => track.stop());
+                releaseWakeLock();
+                setIsRecording(false);
+            };
+
+            recorder.onerror = (event) => {
+                console.error("MediaRecorder error:", event);
+                alert("An error occurred during recording.");
+                stream.getTracks().forEach(track => track.stop());
+                releaseWakeLock();
+                setIsRecording(false);
+            };
+
+            recorder.start();
+            setIsRecording(true);
+        } catch (err: any) {
+            console.error("Microphone access error:", err);
+            if (err.name === 'NotAllowedError') {
+                alert("Microphone access denied. Please allow microphone access in your browser settings.");
+            } else {
+                alert("Could not access the microphone.");
+            }
+        }
     }
-  };
+};
 
   const handleSubmit = async (e?: FormEvent) => {
     e?.preventDefault();
@@ -346,22 +455,42 @@ const App: FC = () => {
     const thinkingMessageId = uuidv4();
   
     try {
-      const allText = input.trim();
-      const currentAttachments = attachments;
-  
-      const userMessageParts: Part[] = [{ text: allText }];
-      if (currentAttachments.length > 0) {
-        const fileParts = await Promise.all(
-          currentAttachments.map(att => fileToGenerativePart(att.file))
-        );
-        userMessageParts.push(...fileParts);
+      const userMessageParts: Part[] = [];
+
+      // Process and show loading indicator for attachments
+      if (attachments.length > 0) {
+        setLoadingMessage('Processing files...');
+        setAttachments(prev => prev.map(att => ({ ...att, status: 'processing' })));
+        
+        const fileProcessingPromises = attachments.map(async (att) => {
+            const { file } = att;
+            if (file.type.startsWith('image/') || file.type.startsWith('video/') || file.type.startsWith('audio/')) {
+                return fileToGenerativePart(file);
+            } else if (file.type === 'text/plain' || file.type === 'text/csv') {
+                const textContent = await readFileAsText(file);
+                return { text: `\n\n--- Start of file: ${file.name} ---\n\n${textContent}\n\n--- End of file: ${file.name} ---\n` };
+            } else {
+                // For PDF and other complex files, send the file and a text prompt to analyze it.
+                const filePart = await fileToGenerativePart(file);
+                const textPart = { text: `\nThe user has attached a file named "${file.name}". Please analyze its content to answer the query. If it contains text (including handwritten), extract and use it.` };
+                return [filePart, textPart];
+            }
+        });
+        
+        const processedParts = (await Promise.all(fileProcessingPromises)).flat();
+        userMessageParts.push(...processedParts);
       }
-  
+      
+      // Add user text input if it exists
+      if (input.trim()) {
+        userMessageParts.unshift({ text: input.trim() });
+      }
+
       const userMessage: Message = { id: uuidv4(), role: 'user', parts: userMessageParts };
       const thinkingMessage: Message = { id: thinkingMessageId, role: 'model', parts: [{ text: '...' }] };
   
       setInput('');
-      setAttachments([]);
+      // Attachments will be cleared in the 'finally' block
   
       setChatSessions(prevSessions => {
         if (isNewChat) {
@@ -385,11 +514,11 @@ const App: FC = () => {
       }
   
       const isFirstMessageInChat = isNewChat || (activeChat?.messages.length ?? 0) === 0;
-      if (isFirstMessageInChat && allText) {
+      if (isFirstMessageInChat && input.trim()) {
         try {
           const titleResponse = await ai.models.generateContent({
-            model: CHAT_MODEL,
-            contents: [{ role: 'user', parts: [{ text: allText }] }],
+            model: TITLE_GEN_MODEL,
+            contents: [{ role: 'user', parts: [{ text: input.trim() }] }],
             config: { systemInstruction: TITLE_GEN_INSTRUCTION, stopSequences: ['\n'] }
           });
           const newTitle = titleResponse.text.trim().replace(/"/g, '');
@@ -407,7 +536,8 @@ const App: FC = () => {
       }));
   
       let finalModelMessage: Message;
-  
+      setLoadingMessage('Thinking...'); // Reset after file processing
+
       if (currentMode === 'image-gen') {
         const response = await ai.models.generateContent({
           model: IMAGE_MODEL,
@@ -420,66 +550,106 @@ const App: FC = () => {
   
         const newModelParts: Part[] = response.candidates?.[0]?.content?.parts || [];
         if (newModelParts.length === 0) {
-          newModelParts.push({ text: "I couldn't generate an image from that prompt. Please try again." });
-        } else if (!newModelParts.some(p => 'text' in p && p.text) && newModelParts.some(p => 'inlineData' in p)) {
-          newModelParts.unshift({ text: `Generated image for: "${allText}"` });
+          newModelParts.push({ text: "I couldn't generate a response. Please try again." });
         }
         finalModelMessage = { id: uuidv4(), role: 'model', parts: newModelParts };
+
       } else {
-        const getSystemInstruction = () => (currentAssistant.id !== 'default-gemini' ? currentAssistant.systemInstruction : undefined);
-        let model = CHAT_MODEL;
-        let config: any = { systemInstruction: getSystemInstruction() };
-  
-        if (currentAttachments.length > 0) {
-          model = IMAGE_MODEL;
-          config.responseModalities = [Modality.IMAGE, Modality.TEXT];
+        const userSystemInstruction = currentAssistant.systemInstruction || undefined;
+        
+        let model: string;
+        let config: any = { systemInstruction: userSystemInstruction };
+    
+        switch(currentMode) {
+            case 'heavy': model = HEAVY_MODEL; break;
+            case 'pro': model = PRO_MODEL; break;
+            case 'flash':
+                model = PRO_MODEL;
+                config.thinkingConfig = { thinkingBudget: 0 };
+                break;
+            case 'quick':
+                model = QUICK_MODEL;
+                config.thinkingConfig = { thinkingBudget: 0 };
+                break;
+            default: model = PRO_MODEL; break;
         }
+
         if (useGoogleSearch) config.tools = [{ googleSearch: {} }];
-        if (currentMode === 'superfast') config.thinkingConfig = { thinkingBudget: 0 };
-  
-        const runAgent = (instruction: string, h: Content[], p: Part[]) =>
-          ai.models.generateContent({ model, contents: [...h, { role: 'user', parts: p }], config: { ...config, systemInstruction: instruction } });
-  
+
+        const runAgent = (agentInstruction: string, h: Content[], p: Part[]) => {
+            const combinedInstruction = [userSystemInstruction, agentInstruction].filter(Boolean).join('\n\n---\n\n');
+            return ai.models.generateContent({
+                model,
+                contents: [...h, { role: 'user', parts: p }],
+                config: { ...config, systemInstruction: combinedInstruction }
+            });
+        }
+
         let finalResponse: GenerateContentResponse;
   
-        if (currentMode === 'goat' || currentMode === 'ultra') {
-          setLoadingMessage('Agent 1: Initial Draft...');
-          const initialResponse = await runAgent(INITIAL_SYSTEM_INSTRUCTION, history, userMessage.parts);
-          const refinedHistory = [...history, { role: 'user', parts: userMessage.parts }, initialResponse.candidates![0].content];
-  
-          setLoadingMessage('Agents 2 & 3: Refining...');
-          const [refinement1, refinement2] = await Promise.all([
-            runAgent(REFINEMENT_SYSTEM_INSTRUCTION, refinedHistory, []),
-            runAgent(REFINEMENT_SYSTEM_INSTRUCTION, refinedHistory, []),
-          ]);
-  
-          let refinedParts = [
-            { text: "--- Refined Response 1 ---\n" }, ...refinement1.candidates![0].content.parts,
-            { text: "\n--- Refined Response 2 ---\n" }, ...refinement2.candidates![0].content.parts,
-          ];
-  
-          if (currentMode === 'goat') {
-            setLoadingMessage('Agents 4 & 5: Refining...');
-            const [refinement3, refinement4] = await Promise.all([
-              runAgent(REFINEMENT_SYSTEM_INSTRUCTION, refinedHistory, []),
-              runAgent(REFINEMENT_SYSTEM_INSTRUCTION, refinedHistory, []),
-            ]);
-            refinedParts.push(
-              { text: "\n--- Refined Response 3 ---\n" }, ...refinement3.candidates![0].content.parts,
-              { text: "\n--- Refined Response 4 ---\n" }, ...refinement4.candidates![0].content.parts
-            );
-          }
-  
-          setLoadingMessage('Synthesizing Final Answer...');
-          finalResponse = await runAgent(SYNTHESIZER_SYSTEM_INSTRUCTION, history, [...userMessage.parts, ...refinedParts]);
+        if (currentMode === 'heavy' || currentMode === 'pro') {
+            setLoadingMessage('Agent 1: Initial Draft...');
+            const initialResponse = await runAgent(INITIAL_SYSTEM_INSTRUCTION, history, userMessage.parts);
+            const initialContent = initialResponse.candidates?.[0]?.content;
+        
+            if (!initialContent?.parts?.length) {
+                finalResponse = initialResponse; // Agent failed, use its response directly
+            } else {
+                const refinedHistory = [...history, { role: 'user', parts: userMessage.parts }, initialContent];
+        
+                setLoadingMessage('Agents 2 & 3: Refining...');
+                const [refinement1, refinement2] = await Promise.all([
+                    runAgent(REFINEMENT_SYSTEM_INSTRUCTION, refinedHistory, []),
+                    runAgent(REFINEMENT_SYSTEM_INSTRUCTION, refinedHistory, []),
+                ]);
+        
+                setLoadingMessage('Agents 4 & 5: Refining...');
+                const [refinement3, refinement4] = await Promise.all([
+                    runAgent(REFINEMENT_SYSTEM_INSTRUCTION, refinedHistory, []),
+                    runAgent(REFINEMENT_SYSTEM_INSTRUCTION, refinedHistory, []),
+                ]);
+                const refinedParts = [
+                    { text: "--- Refined Response 1 ---\n" }, ...(refinement1.candidates?.[0]?.content?.parts || []),
+                    { text: "\n--- Refined Response 2 ---\n" }, ...(refinement2.candidates?.[0]?.content?.parts || []),
+                    { text: "\n--- Refined Response 3 ---\n" }, ...(refinement3.candidates?.[0]?.content?.parts || []),
+                    { text: "\n--- Refined Response 4 ---\n" }, ...(refinement4.candidates?.[0]?.content?.parts || [])
+                ];
+        
+                setLoadingMessage('Synthesizing Final Answer...');
+                finalResponse = await runAgent(SYNTHESIZER_SYSTEM_INSTRUCTION, history, [...userMessage.parts, ...refinedParts]);
+            }
+        } else if (currentMode === 'flash') {
+            setLoadingMessage('Agent 1: Initial Draft...');
+            const initialResponse = await runAgent(INITIAL_SYSTEM_INSTRUCTION, history, userMessage.parts);
+            const initialContent = initialResponse.candidates?.[0]?.content;
+
+            if (!initialContent?.parts?.length) {
+                finalResponse = initialResponse; // Agent failed, use its response directly
+            } else {
+                const refinedHistory = [...history, { role: 'user', parts: userMessage.parts }, initialContent];
+
+                setLoadingMessage('Agents 2 & 3: Refining...');
+                const [refinement1, refinement2] = await Promise.all([
+                    runAgent(REFINEMENT_SYSTEM_INSTRUCTION, refinedHistory, []),
+                    runAgent(REFINEMENT_SYSTEM_INSTRUCTION, refinedHistory, []),
+                ]);
+                const refinedParts = [
+                    { text: "--- Refined Response 1 ---\n" }, ...(refinement1.candidates?.[0]?.content?.parts || []),
+                    { text: "\n--- Refined Response 2 ---\n" }, ...(refinement2.candidates?.[0]?.content?.parts || []),
+                ];
+
+                setLoadingMessage('Synthesizing Final Answer...');
+                finalResponse = await runAgent(SYNTHESIZER_SYSTEM_INSTRUCTION, history, [...userMessage.parts, ...refinedParts]);
+            }
         } else {
-          finalResponse = await ai.models.generateContent({ model, contents: [...history, { role: 'user', parts: userMessage.parts }], config });
+            // Single agent logic for 'quick' and fallback modes
+            finalResponse = await ai.models.generateContent({ model, contents: [...history, { role: 'user', parts: userMessage.parts }], config });
         }
   
         finalModelMessage = {
           id: uuidv4(),
           role: 'model',
-          parts: finalResponse.candidates?.[0].content.parts || [{ text: "Sorry, I couldn't generate a response." }],
+          parts: finalResponse.candidates?.[0]?.content?.parts || [{ text: "Sorry, I couldn't generate a response." }],
           citations: finalResponse.candidates?.[0]?.groundingMetadata?.groundingChunks,
         };
       }
@@ -501,22 +671,40 @@ const App: FC = () => {
     } finally {
       setIsLoading(false);
       setLoadingMessage('');
+      setAttachments([]);
     }
   };
   
   const handleSaveAssistant = (assistant: Assistant) => {
-    if (editingAssistant) {
+    const isEditing = assistants.some(a => a.id === assistant.id);
+    if (isEditing) {
         setAssistants(assistants.map(a => a.id === assistant.id ? assistant : a));
     } else {
         setAssistants([...assistants, assistant]);
     }
-    setEditingAssistant(null);
-    setIsAssistantModalOpen(false);
+    setAssistantInEditor(null);
+    setMainView('chat');
   };
   
   const handleDeleteAssistant = (assistantId: string) => {
     if (confirm('Are you sure you want to delete this assistant?')) {
-        setAssistants(assistants.filter(a => a.id !== assistantId));
+        // Update chat sessions that use this assistant to fall back to default
+        setChatSessions(prevSessions =>
+            prevSessions.map(session =>
+                session.assistantId === assistantId
+                    ? { ...session, assistantId: DEFAULT_ASSISTANTS[0].id }
+                    : session
+            )
+        );
+
+        // Update the list of assistants
+        setAssistants(prev => prev.filter(a => a.id !== assistantId));
+
+        // If the deleted assistant was the one selected for new chats,
+        // switch the current selection back to the default assistant.
+        if (currentAssistantId === assistantId) {
+            setCurrentAssistantId(DEFAULT_ASSISTANTS[0].id);
+        }
     }
   };
 
@@ -541,6 +729,48 @@ const App: FC = () => {
     }
     setIsApiKeyModalOpen(false);
   };
+
+  const handleDragEnter = useCallback((e: React.DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dragCounter.current++;
+      if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
+          setIsDraggingOver(true);
+      }
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dragCounter.current--;
+      if (dragCounter.current === 0) {
+          setIsDraggingOver(false);
+      }
+  }, []);
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+  }, []);
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setIsDraggingOver(false);
+      dragCounter.current = 0;
+      if (isLoading) return;
+
+      if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+          const files = Array.from(e.dataTransfer.files);
+          const newAttachments: Attachment[] = files.map(file => ({
+              file,
+              previewUrl: URL.createObjectURL(file),
+              status: 'idle',
+          }));
+          setAttachments(prev => [...prev, ...newAttachments]);
+          e.dataTransfer.clearData();
+      }
+  }, [isLoading]);
 
 
   const renderMessagePart = (part: Part, index: number) => {
@@ -579,7 +809,7 @@ const App: FC = () => {
       <div className={`sidebar ${isSidebarOpen ? 'open' : ''}`}>
         <div className="sidebar-header">
             <h1 className="sidebar-title">Gemini Advanced</h1>
-            <button className="icon-button new-chat-button" onClick={createNewChat} aria-label="New Chat">
+            <button className="icon-button new-chat-button" onClick={() => createNewChat()} aria-label="New Chat">
                 <PlusIcon />
             </button>
         </div>
@@ -614,151 +844,234 @@ const App: FC = () => {
             </button>
         </div>
       </div>
-      <div className="chat-area">
-        <div className="chat-header">
-            <div className="chat-title-group">
-                <button className="icon-button mobile-menu-button" onClick={() => setIsSidebarOpen(!isSidebarOpen)}>
-                    <MenuIcon />
-                </button>
-                <div className="avatar small-avatar">{currentAssistant.avatar}</div>
-                <h2 className="chat-title">{activeChat?.title || 'New Chat'}</h2>
-            </div>
-          
-            <div className="mode-selector">
-                <select value={currentMode} onChange={handleModeChange}>
-                    <option value="superfast">Superfast</option>
-                    <option value="super">Super</option>
-                    <option value="ultra">Ultra</option>
-                    <option value="goat">G.O.A.T</option>
-                    <option value="image-gen">Image Gen</option>
-                </select>
-            </div>
-        </div>
-        <div className="message-list" ref={messageListRef}>
-            {activeChat ? activeChat.messages.map(msg => {
-                const isUser = msg.role === 'user';
-                const avatarChar = isUser ? 'U' : currentAssistant.avatar;
-                const showThinking = isLoading && msg.parts[0].text === '...';
-
-                return (
-                    <div key={msg.id} className={`message-container ${msg.role}`}>
-                        <div className="avatar">{avatarChar}</div>
-                        <div className="message-bubble">
-                            <div className="message-content">
-                                {showThinking ? (
-                                    <div className="loading-indicator">
-                                        <div className="spinner"></div>
-                                        <p>{loadingMessage}</p>
-                                    </div>
-                                ) : (
-                                    <>
-                                        {msg.parts.map(renderMessagePart)}
-                                        {msg.citations && msg.citations.length > 0 && (
-                                            <div className="citations">
-                                                <h4 className="citation-title">Sources</h4>
-                                                {msg.citations.map((citation, i) => (
-                                                    <a key={i} href={citation.web.uri} target="_blank" rel="noopener noreferrer" className="citation-link">
-                                                        {i+1}. {citation.web.title}
-                                                    </a>
-                                                ))}
-                                            </div>
-                                        )}
-                                    </>
-                                )}
-                            </div>
-                        </div>
-                    </div>
-                )
-            }) : (
-                 <div style={{textAlign: 'center', margin: 'auto', color: 'var(--text-secondary)'}}>
-                    <h2>Gemini Advanced</h2>
-                    <p>Select an assistant and start a new chat.</p>
+      <div 
+        className="chat-area"
+        onDrop={handleDrop}
+        onDragOver={handleDragOver}
+        onDragEnter={handleDragEnter}
+        onDragLeave={handleDragLeave}
+      >
+        {isDraggingOver && !isLoading && (
+            <div className="drop-zone-overlay">
+                <div className="drop-zone-content">
+                    <UploadIcon />
+                    <p>Drop files here to upload</p>
                 </div>
-            )}
-        </div>
-        <div className="input-area-container">
-            {attachments.length > 0 && (
-                <div className="attachments-preview">
-                    {attachments.map((att, index) => (
-                        <div key={index} className="attachment-item">
-                           {att.file.type.startsWith('image/') ? (
-                                <img src={att.previewUrl} alt={att.file.name} />
-                            ) : (
-                                <div className="file-placeholder">
-                                    <FileIcon/>
-                                    <span>{att.file.name}</span>
+            </div>
+        )}
+        {mainView === 'assistantEditor' ? (
+            <AssistantEditor
+                assistant={assistantInEditor}
+                onSave={handleSaveAssistant}
+                onCancel={() => {
+                    setMainView('chat');
+                    setAssistantInEditor(null);
+                }}
+            />
+        ) : (
+            <>
+                <div className="chat-header">
+                    <div className="chat-title-group">
+                        <button className="icon-button mobile-menu-button" onClick={() => setIsSidebarOpen(!isSidebarOpen)}>
+                            <MenuIcon />
+                        </button>
+                        <div className="avatar small-avatar">{currentAssistant.avatar}</div>
+                        <h2 className="chat-title">{activeChat?.title || 'New Chat'}</h2>
+                    </div>
+                
+                    <div className="mode-selector">
+                        <select value={currentMode} onChange={handleModeChange}>
+                            <option value="quick" title="Quick: 1x Gemini 2.5 Flash Lite agent for near-instantaneous responses.">Quick</option>
+                            <option value="flash" title="Flash: 2x Gemini 2.5 Flash agents (fast) for quick and efficient answers.">Flash</option>
+                            <option value="pro" title="Pro: 4x Gemini 2.5 Flash agents for balanced, high-quality responses.">Pro</option>
+                            <option value="heavy" title="Heavy: 4x Gemini 2.5 Pro agents for maximum quality and reasoning.">Heavy</option>
+                            <option value="image-gen">Image Gen</option>
+                        </select>
+                    </div>
+                </div>
+                <div className="message-list" ref={messageListRef}>
+                    {activeChat ? (
+                        <>
+                            {activeChat.messages.length === 0 && currentAssistant.startMessages?.some(m => m) && (
+                                <div className="start-messages-container">
+                                    <div className="start-messages-grid">
+                                        {currentAssistant.startMessages.map((msg, index) => msg && (
+                                            <button key={index} className="start-message-card" onClick={() => {
+                                                setInput(msg);
+                                                // Wait for state to update, then focus and submit
+                                                setTimeout(() => textareaRef.current?.focus(), 0);
+                                            }}>
+                                                <p className="start-message-text">{msg}</p>
+                                            </button>
+                                        ))}
+                                    </div>
                                 </div>
                             )}
-                            <button className="remove-attachment-button" onClick={() => removeAttachment(index)}>&times;</button>
+                            {activeChat.messages.map(msg => {
+                                const isUser = msg.role === 'user';
+                                const avatarChar = isUser ? 'U' : currentAssistant.avatar;
+                                const showThinking = isLoading && msg.parts[0].text === '...';
+
+                                return (
+                                    <div key={msg.id} className={`message-container ${msg.role}`}>
+                                        <div className="avatar">{avatarChar}</div>
+                                        <div className="message-bubble">
+                                            <div className="message-content">
+                                                {showThinking ? (
+                                                    <div className="loading-indicator">
+                                                        <div className="spinner"></div>
+                                                        <p>{loadingMessage}</p>
+                                                    </div>
+                                                ) : (
+                                                    <>
+                                                        {msg.parts.map(renderMessagePart)}
+                                                        {msg.citations && msg.citations.length > 0 && (
+                                                            <div className="citations">
+                                                                <h4 className="citation-title">Sources</h4>
+                                                                {msg.citations.map((citation, i) => (
+                                                                    <a key={i} href={citation.web.uri} target="_blank" rel="noopener noreferrer" className="citation-link">
+                                                                        {i+1}. {citation.web.title}
+                                                                    </a>
+                                                                ))}
+                                                            </div>
+                                                        )}
+                                                    </>
+                                                )}
+                                            </div>
+                                        </div>
+                                    </div>
+                                )
+                            })}
+                        </>
+                    ) : (
+                        <div className="empty-chat-view">
+                            <div className="avatar large-avatar">{currentAssistant.avatar}</div>
+                            <h2>{currentAssistant.name}</h2>
+                             {currentAssistant.startMessages?.some(m => m) && (
+                                <div className="start-messages-container">
+                                    <div className="start-messages-grid">
+                                        {currentAssistant.startMessages.map((msg, index) => msg && (
+                                            <button key={index} className="start-message-card" onClick={() => {
+                                                createNewChat();
+                                                setInput(msg);
+                                                setTimeout(() => textareaRef.current?.focus(), 0);
+                                            }}>
+                                                <p className="start-message-text">{msg}</p>
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
                         </div>
-                    ))}
+                    )}
                 </div>
-            )}
-            <form className="input-form" onSubmit={handleSubmit}>
-              <button 
-                  type="button" 
-                  className="icon-button" 
-                  aria-label="Attach file"
-                  onClick={() => fileInputRef.current?.click()}
-              >
-                  <AttachmentIcon />
-              </button>
-              <input 
-                  type="file" 
-                  multiple 
-                  ref={fileInputRef} 
-                  onChange={handleAttachment}
-                  style={{ display: 'none' }} 
-                  accept="image/*,video/*,audio/*,text/*,.pdf,.doc,.docx"
-              />
-              <textarea
-                ref={textareaRef}
-                className="input-field"
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
-                    handleSubmit();
-                  }
-                }}
-                placeholder={`Message ${currentAssistant.name}...`}
-                rows={1}
-                disabled={isLoading}
-              />
-              <button type="button" className={`icon-button ${isRecording ? 'recording' : ''}`} onClick={toggleRecording} disabled={isLoading} aria-label="Use microphone">
-                  <MicIcon />
-              </button>
-              <button type="submit" className="icon-button send-button" disabled={(!input.trim() && attachments.length === 0) || isLoading} aria-label="Send message">
-                  <SendIcon />
-              </button>
-            </form>
-            <div style={{display: 'flex', justifyContent: 'center', paddingTop: '0.5rem'}}>
-                <div className="search-toggle">
-                     <span className="search-toggle-label">Google Search</span>
-                     <label className="switch">
-                        <input type="checkbox" checked={useGoogleSearch} onChange={(e) => setUseGoogleSearch(e.target.checked)} />
-                        <span className="slider"></span>
-                    </label>
+                <div className="input-area-container">
+                    {attachments.length > 0 && (
+                        <div className="attachments-preview">
+                            {attachments.map((att, index) => (
+                                <div key={index} className="attachment-item">
+                                    {att.file.type.startsWith('image/') ? (
+                                        <img src={att.previewUrl} alt={att.file.name} />
+                                    ) : att.file.type.startsWith('audio/') ? (
+                                        <div className="audio-placeholder">
+                                            <AudioIcon />
+                                            <audio src={att.previewUrl} controls className="audio-preview-player" />
+                                        </div>
+                                    ) : (
+                                        <div className="file-placeholder">
+                                            <FileIcon/>
+                                            <span>{att.file.name}</span>
+                                        </div>
+                                    )}
+                                    {att.status === 'processing' && (
+                                        <div className="processing-overlay">
+                                            <div className="spinner-small"></div>
+                                        </div>
+                                    )}
+                                    <button className="remove-attachment-button" onClick={() => removeAttachment(index)} disabled={isLoading}>&times;</button>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                    <form className="input-form" onSubmit={handleSubmit}>
+                    <button 
+                        type="button" 
+                        className="icon-button" 
+                        aria-label="Attach file"
+                        onClick={() => fileInputRef.current?.click()}
+                        disabled={isLoading}
+                    >
+                        <AttachmentIcon />
+                    </button>
+                    <input 
+                        type="file" 
+                        multiple 
+                        ref={fileInputRef} 
+                        onChange={handleAttachment}
+                        style={{ display: 'none' }} 
+                        accept="image/*,video/*,audio/*,text/*,.pdf,.csv,.doc,.docx"
+                    />
+                    <textarea
+                        ref={textareaRef}
+                        className="input-field"
+                        value={input}
+                        onChange={(e) => setInput(e.target.value)}
+                        onKeyDown={(e) => {
+                        if (e.key === 'Enter' && !e.shiftKey) {
+                            e.preventDefault();
+                            handleSubmit();
+                        }
+                        }}
+                        placeholder={`Message ${currentAssistant.name}...`}
+                        rows={1}
+                        disabled={isLoading}
+                    />
+                    <button
+                        type="button"
+                        className={`icon-button ${isRecording ? 'recording' : ''}`}
+                        onClick={toggleRecording}
+                        disabled={isLoading || !isMicrophoneSupported}
+                        aria-label={isMicrophoneSupported ? (isRecording ? "Stop recording" : "Start recording") : "Microphone not supported"}
+                        title={isMicrophoneSupported ? (isRecording ? "Stop recording" : "Start recording") : "Microphone is not supported in your browser"}
+                    >
+                        <MicIcon />
+                    </button>
+                    <button type="submit" className="icon-button send-button" disabled={(!input.trim() && attachments.length === 0) || isLoading} aria-label="Send message">
+                        <SendIcon />
+                    </button>
+                    </form>
+                    <div style={{display: 'flex', justifyContent: 'center', paddingTop: '0.5rem'}}>
+                        <div className="search-toggle">
+                            <span className="search-toggle-label">Google Search</span>
+                            <label className="switch">
+                                <input type="checkbox" checked={useGoogleSearch} onChange={(e) => setUseGoogleSearch(e.target.checked)} />
+                                <span className="slider"></span>
+                            </label>
+                        </div>
+                    </div>
                 </div>
-            </div>
-        </div>
+            </>
+        )}
       </div>
       {isAssistantModalOpen && 
         <AssistantGalleryModal 
             assistants={assistants}
             onClose={() => setIsAssistantModalOpen(false)}
-            onSave={handleSaveAssistant}
             onDelete={handleDeleteAssistant}
             onEdit={(assistant) => {
-                setEditingAssistant(assistant);
+                setAssistantInEditor(assistant);
+                setMainView('assistantEditor');
+                setIsAssistantModalOpen(false);
             }}
             onSelect={(id) => {
                 switchAssistant(id);
                 setIsAssistantModalOpen(false);
             }}
-            editingAssistant={editingAssistant}
-            setEditingAssistant={setEditingAssistant}
+            onCreate={() => {
+                setAssistantInEditor(null);
+                setMainView('assistantEditor');
+                setIsAssistantModalOpen(false);
+            }}
         />
       }
       {(!apiKey || isApiKeyModalOpen) &&
@@ -825,126 +1138,171 @@ const ApiKeyModal: FC<{
     );
 };
 
-
-const AssistantGalleryModal: FC<{
-    assistants: Assistant[];
-    onClose: () => void;
+const AssistantEditor: FC<{
+    assistant: Assistant | null;
     onSave: (assistant: Assistant) => void;
-    onDelete: (id: string) => void;
-    onEdit: (assistant: Assistant) => void;
-    onSelect: (id: string) => void;
-    editingAssistant: Assistant | null;
-    setEditingAssistant: (assistant: Assistant | null) => void;
-}> = ({ assistants, onClose, onSave, onDelete, onEdit, onSelect, editingAssistant, setEditingAssistant }) => {
-    
-    const [formData, setFormData] = useState<Omit<Assistant, 'id' | 'avatar'>>({
-        name: '', description: '', systemInstruction: '', defaultMode: 'super'
+    onCancel: () => void;
+}> = ({ assistant, onSave, onCancel }) => {
+    const [formData, setFormData] = useState({
+        name: '',
+        description: '',
+        systemInstruction: '',
+        defaultMode: 'pro' as AppMode,
+        startMessages: ['', '', '', ''],
     });
 
     useEffect(() => {
-        if (editingAssistant) {
+        if (assistant) {
             setFormData({
-                name: editingAssistant.name,
-                description: editingAssistant.description,
-                systemInstruction: editingAssistant.systemInstruction,
-                defaultMode: editingAssistant.defaultMode,
+                name: assistant.name,
+                description: assistant.description,
+                systemInstruction: assistant.systemInstruction,
+                defaultMode: assistant.defaultMode,
+                startMessages: [
+                    ...(assistant.startMessages || []),
+                    ...Array(4).fill('')
+                ].slice(0, 4),
             });
-        } else {
-            setFormData({ name: '', description: '', systemInstruction: '', defaultMode: 'super' });
         }
-    }, [editingAssistant]);
-
+    }, [assistant]);
+    
     const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => {
         const { name, value } = e.target;
         setFormData(prev => ({ ...prev, [name]: value }));
     };
+    
+    const handleStartMessageChange = (index: number, value: string) => {
+        const newStartMessages = [...formData.startMessages];
+        newStartMessages[index] = value;
+        setFormData(prev => ({ ...prev, startMessages: newStartMessages }));
+    };
 
     const handleSubmit = (e: FormEvent) => {
         e.preventDefault();
-        if (!formData.name) return;
+        if (!formData.name.trim()) {
+            alert("Assistant name is required.");
+            return;
+        }
         
-        const assistantData: Assistant = editingAssistant
-            ? { ...editingAssistant, ...formData }
-            : {
-                id: uuidv4(),
-                avatar: formData.name.charAt(0).toUpperCase(),
-                ...formData,
-            };
-        onSave(assistantData);
-        setEditingAssistant(null);
+        const finalAssistant: Assistant = {
+            id: assistant?.id || uuidv4(),
+            avatar: formData.name.charAt(0).toUpperCase(),
+            ...formData,
+            startMessages: formData.startMessages.filter(m => m.trim() !== ''),
+        };
+        
+        onSave(finalAssistant);
     };
 
+    return (
+        <div className="assistant-editor">
+            <div className="assistant-editor-header">
+                <h2>{assistant ? 'Edit Assistant' : 'Create new assistant'}</h2>
+                <p>Create and share your own AI Assistant. All assistants are <span className="public-tag">public</span></p>
+            </div>
+            <form onSubmit={handleSubmit} className="assistant-editor-form">
+                <div className="form-columns">
+                    <div className="form-column left">
+                        <div className="form-group">
+                            <label>Avatar</label>
+                            <button type="button" className="button button-secondary" disabled>
+                                <UploadIcon/> Upload
+                            </button>
+                            <p className="modal-description">Avatar is automatically generated from the first letter of the name.</p>
+                        </div>
+                        <div className="form-group">
+                            <label htmlFor="name">Name</label>
+                            <input id="name" name="name" type="text" value={formData.name} onChange={handleChange} className="modal-input" placeholder="Assistant Name" required />
+                        </div>
+                        <div className="form-group">
+                            <label htmlFor="description">Description</label>
+                            <textarea id="description" name="description" value={formData.description} onChange={handleChange} className="modal-input" placeholder="He knows everything about python" required rows={3} />
+                        </div>
+                        <div className="form-group">
+                            <label htmlFor="defaultMode">Model</label>
+                            <select id="defaultMode" name="defaultMode" value={formData.defaultMode} onChange={handleChange} className="modal-input">
+                                <option value="quick">Quick</option>
+                                <option value="flash">Flash</option>
+                                <option value="pro">Pro</option>
+                                <option value="heavy">Heavy</option>
+                                <option value="image-gen">Image Gen</option>
+                            </select>
+                        </div>
+                         <div className="form-group">
+                            <label>User start messages</label>
+                            <div className="start-message-inputs">
+                                {formData.startMessages.map((msg, index) => (
+                                    <input
+                                        key={index}
+                                        type="text"
+                                        value={msg}
+                                        onChange={(e) => handleStartMessageChange(index, e.target.value)}
+                                        className="modal-input"
+                                        placeholder={`Start Message ${index + 1}`}
+                                    />
+                                ))}
+                            </div>
+                        </div>
+                    </div>
+                    <div className="form-column right">
+                        <div className="form-group full-height">
+                             <label htmlFor="systemInstruction">Instructions (System Prompt)</label>
+                             <textarea id="systemInstruction" name="systemInstruction" value={formData.systemInstruction} onChange={handleChange} className="modal-textarea" placeholder="You'll act as..." />
+                        </div>
+                    </div>
+                </div>
+                <div className="form-actions">
+                    <button type="button" className="button button-secondary" onClick={onCancel}>Cancel</button>
+                    <button type="submit" className="button button-primary">{assistant ? 'Save Changes' : 'Create Assistant'}</button>
+                </div>
+            </form>
+        </div>
+    );
+};
+
+
+const AssistantGalleryModal: FC<{
+    assistants: Assistant[];
+    onClose: () => void;
+    onDelete: (id: string) => void;
+    onEdit: (assistant: Assistant) => void;
+    onSelect: (id: string) => void;
+    onCreate: () => void;
+}> = ({ assistants, onClose, onDelete, onEdit, onSelect, onCreate }) => {
+    
     const isCustomAssistant = (id: string) => !DEFAULT_ASSISTANTS.some(da => da.id === id);
-
-    const startCreating = () => {
-        setEditingAssistant(null); // Ensure we are in "create" mode
-        setFormData({ name: '', description: '', systemInstruction: '', defaultMode: 'super' });
-    };
 
     return (
         <div className="modal-overlay" onClick={onClose}>
             <div className="modal-content" onClick={e => e.stopPropagation()}>
                 <div className="modal-header">
-                    <h2 className="modal-title">{editingAssistant ? 'Edit Assistant' : 'Assistants'}</h2>
+                    <h2 className="modal-title">Assistants</h2>
                     <button className="icon-button modal-close-button" onClick={onClose}><CloseIcon/></button>
                 </div>
 
-                {!editingAssistant && (
-                    <>
-                        <div className="assistant-gallery-list">
-                            {assistants.map(assistant => (
-                                <div key={assistant.id} className="assistant-card">
-                                    <div className="avatar">{assistant.avatar}</div>
-                                    <div className="assistant-card-info">
-                                        <h3>{assistant.name}</h3>
-                                        <p>{assistant.description}</p>
-                                    </div>
-                                    <div className="assistant-card-actions">
-                                        <button className="button button-primary" onClick={() => onSelect(assistant.id)}>Select</button>
-                                        {isCustomAssistant(assistant.id) && (
-                                            <>
-                                            <button className="icon-button" onClick={() => onEdit(assistant)}><EditIcon/></button>
-                                            <button className="icon-button" onClick={() => onDelete(assistant.id)}><DeleteIcon/></button>
-                                            </>
-                                        )}
-                                    </div>
-                                </div>
-                            ))}
+                <div className="assistant-gallery-list">
+                    {assistants.map(assistant => (
+                        <div key={assistant.id} className="assistant-card">
+                            <div className="avatar">{assistant.avatar}</div>
+                            <div className="assistant-card-info">
+                                <h3>{assistant.name}</h3>
+                                <p>{assistant.description}</p>
+                            </div>
+                            <div className="assistant-card-actions">
+                                <button className="button button-primary" onClick={() => onSelect(assistant.id)}>Select</button>
+                                {isCustomAssistant(assistant.id) && (
+                                    <>
+                                    <button className="icon-button" onClick={() => onEdit(assistant)}><EditIcon/></button>
+                                    <button className="icon-button" onClick={() => onDelete(assistant.id)}><DeleteIcon/></button>
+                                    </>
+                                )}
+                            </div>
                         </div>
-                        <div className="modal-actions">
-                            <button className="button button-primary" onClick={startCreating}>Create New Assistant</button>
-                        </div>
-                    </>
-                )}
-                
-                {(editingAssistant !== null || !assistants.length) && (
-                     <form onSubmit={handleSubmit} className="modal-form">
-                        <label htmlFor="name">Name</label>
-                        <input id="name" name="name" type="text" value={formData.name} onChange={handleChange} className="modal-input" required />
-
-                        <label htmlFor="description">Description</label>
-                        <input id="description" name="description" type="text" value={formData.description} onChange={handleChange} className="modal-input" required />
-
-                        <label htmlFor="systemInstruction">System Instruction</label>
-                        <textarea id="systemInstruction" name="systemInstruction" value={formData.systemInstruction} onChange={handleChange} className="modal-textarea" />
-                        <p className="modal-description">Provide instructions for how the assistant should behave.</p>
-                        
-                        <label htmlFor="defaultMode">Default Mode</label>
-                        <select id="defaultMode" name="defaultMode" value={formData.defaultMode} onChange={handleChange} className="modal-input">
-                            <option value="superfast">Superfast</option>
-                            <option value="super">Super</option>
-                            <option value="ultra">Ultra</option>
-                            <option value="goat">G.O.A.T</option>
-                            <option value="image-gen">Image Gen</option>
-                        </select>
-                        <p className="modal-description">The mode this assistant will start with in new chats.</p>
-
-                        <div className="modal-actions">
-                           {editingAssistant && <button type="button" className="button button-secondary" onClick={() => setEditingAssistant(null)}>Cancel</button>}
-                            <button type="submit" className="button button-primary">{editingAssistant ? 'Save Changes' : 'Create Assistant'}</button>
-                        </div>
-                    </form>
-                )}
+                    ))}
+                </div>
+                <div className="modal-actions">
+                    <button className="button button-primary" onClick={onCreate}>Create New Assistant</button>
+                </div>
             </div>
         </div>
     );
